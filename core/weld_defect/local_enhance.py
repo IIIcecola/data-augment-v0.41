@@ -1,0 +1,177 @@
+import os
+import random
+import torch
+from PIL import Image
+import argparse
+from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
+
+def get_crop_coordinates(original_width, original_height, x1, y1, x2, y2, pipe):
+    """
+    处理用户输入的裁剪坐标，确保裁剪区域尺寸为16的倍数
+    返回微调后的坐标和裁剪区域尺寸
+    """
+    # 确保坐标合法性（左上角<=右下角，且在原图范围内）
+    x1, x2 = sorted([x1, x2])
+    y1, y2 = sorted([y1, y2])
+    x1 = max(0, min(x1, original_width))
+    x2 = max(0, min(x2, original_width))
+    y1 = max(0, min(y1, original_height))
+    y2 = max(0, min(y2, original_height))
+    
+    # 计算原始裁剪尺寸
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    
+    # 使用模型方法调整尺寸为16的倍数
+    adjusted_height, adjusted_width = pipe.check_resize_height_width(crop_height, crop_width)
+    
+    # 计算尺寸调整后的坐标偏移（保持中心不变）
+    width_diff = adjusted_width - crop_width
+    height_diff = adjusted_height - crop_height
+    
+    new_x1 = max(0, x1 - width_diff // 2)
+    new_x2 = min(original_width, x2 + (width_diff - width_diff // 2))
+    new_y1 = max(0, y1 - height_diff // 2)
+    new_y2 = min(original_height, y2 + (height_diff - height_diff // 2))
+    
+    # 最终校验（避免因原图边界导致的尺寸偏差）
+    final_width = new_x2 - new_x1
+    final_height = new_y2 - new_y1
+    final_height, final_width = pipe.check_resize_height_width(final_height, final_width)
+    
+    return (x1, y1, x2, y2), (new_x1, new_y1, new_x2, new_y2), (final_width, final_height)
+
+def crop_image(image, coordinates):
+    """根据坐标裁剪图片"""
+    x1, y1, x2, y2 = coordinates
+    return image.crop((x1, y1, x2, y2))
+
+def paste_cropped_image(original_image, cropped_image, coordinates):
+    """将裁剪区域图片粘贴回原图"""
+    x1, y1, x2, y2 = coordinates
+    # 确保尺寸匹配
+    cropped_resized = cropped_image.resize((x2 - x1, y2 - y1))
+    result = original_image.copy()
+    result.paste(cropped_resized, (x1, y1))
+    return result
+
+def process_single_image(
+    image_path,
+    output_dir,
+    lora_path,
+    crop_coords,  # (x1, y1, x2, y2)
+    num_inference_steps=10,
+    seed=None
+):
+    # 创建输出目录结构
+    hr_crop_dir = os.path.join(output_dir, "HR_Crop")
+    hr_crop_enhanced_dir = os.path.join(output_dir, "HR_Crop_Enhanced")
+    weld_enhanced_dir = os.path.join(output_dir, "WeldDefect_Enhanced")
+    os.makedirs(hr_crop_dir, exist_ok=True)
+    os.makedirs(hr_crop_enhanced_dir, exist_ok=True)
+    os.makedirs(weld_enhanced_dir, exist_ok=True)
+    
+    # 加载模型管道
+    pipe = QwenImagePipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        model_configs=[
+            ModelConfig(model_id="Qwen/Qwen-Image-Edit-2509", origin_file_pattern="transformer/diffusion_pytorch_model*.safetensors"),
+            ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="text_encoder/model*.safetensors"),
+            ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="vae/diffusion_pytorch_model.safetensors"),
+        ],
+        tokenizer_config=None,
+        processor_config=ModelConfig(model_id="Qwen/Qwen-Image-Edit", origin_file_pattern="processor/"),
+    )
+    pipe.load_lora(pipe.dit, lora_path)
+    
+    # 加载原图
+    try:
+        original_image = Image.open(image_path).convert('RGB')
+        original_width, original_height = original_image.size
+        print(f"原图尺寸：{original_width}x{original_height}")
+        print(f"用户输入裁剪坐标：{crop_coords}")
+    except Exception as e:
+        print(f"加载原图失败：{str(e)}")
+        return
+    
+    # 处理裁剪坐标
+    user_coords, adjusted_coords, (final_width, final_height) = get_crop_coordinates(
+        original_width, original_height,
+        crop_coords[0], crop_coords[1], crop_coords[2], crop_coords[3],
+        pipe
+    )
+    print(f"微调后裁剪坐标：{adjusted_coords}")
+    print(f"局部图尺寸：{final_width}x{final_height}")
+    
+    # 裁剪局部图并保存
+    cropped_image = crop_image(original_image, adjusted_coords)
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    crop_save_path = os.path.join(hr_crop_dir, f"{base_name}_cropped.jpg")
+    cropped_image.save(crop_save_path)
+    print(f"已保存裁剪局部图：{crop_save_path}")
+    
+    # 局部图增强推理
+    try:
+        # 调整尺寸并包装为列表（匹配模型输入格式）
+        resized_crop = cropped_image.resize((final_width, final_height))
+        input_images = [resized_crop]
+        
+        # 生成增强结果（可根据需求修改prompt）
+        prompt = "生成焊接缺陷，保持原有场景结构，增强缺陷特征"
+        with torch.no_grad():
+            enhanced_crop = pipe(
+                prompt,
+                edit_image=input_images,
+                seed=seed if seed is not None else random.randint(0, 10000),
+                num_inference_steps=num_inference_steps,
+                height=final_height,
+                width=final_width
+            )
+        
+        # 保存增强后的局部图
+        enhanced_crop_save_path = os.path.join(hr_crop_enhanced_dir, f"{base_name}_cropped_enhanced.jpg")
+        enhanced_crop.save(enhanced_crop_save_path)
+        print(f"已保存增强局部图：{enhanced_crop_save_path}")
+    except Exception as e:
+        print(f"局部图增强失败：{str(e)}")
+        return
+    
+    # 缝合回原图并保存
+    try:
+        final_image = paste_cropped_image(original_image, enhanced_crop, adjusted_coords)
+        final_save_path = os.path.join(weld_enhanced_dir, f"{base_name}_enhanced.jpg")
+        final_image.save(final_save_path)
+        print(f"已保存最终增强图：{final_save_path}")
+    except Exception as e:
+        print(f"缝合图片失败：{str(e)}")
+        return
+    
+    torch.cuda.empty_cache()
+
+def main():
+    parser = argparse.ArgumentParser(description='焊接缺陷局部增强工具（裁剪-增强-缝合流程）')
+    parser.add_argument('image_path', help='输入图片路径')
+    parser.add_argument('output_dir', help='输出目录')
+    parser.add_argument('lora_path', help='LoRA模型路径')
+    parser.add_argument('--x1', type=int, required=True, help='裁剪区域左上角x坐标')
+    parser.add_argument('--y1', type=int, required=True, help='裁剪区域左上角y坐标')
+    parser.add_argument('--x2', type=int, required=True, help='裁剪区域右下角x坐标')
+    parser.add_argument('--y2', type=int, required=True, help='裁剪区域右下角y坐标')
+    parser.add_argument('--steps', type=int, default=10, help='推理步数')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子（默认随机）')
+    
+    args = parser.parse_args()
+    
+    # 执行处理
+    process_single_image(
+        image_path=args.image_path,
+        output_dir=args.output_dir,
+        lora_path=args.lora_path,
+        crop_coords=(args.x1, args.y1, args.x2, args.y2),
+        num_inference_steps=args.steps,
+        seed=args.seed
+    )
+
+if __name__ == "__main__":
+    main()
