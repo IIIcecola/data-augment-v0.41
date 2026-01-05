@@ -9,6 +9,98 @@ from PIL import Image
 import argparse
 from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
 
+def generate_prompts_replacement(target_count, with_replacement=True, use_weights=True):
+    """
+    生成焊接缺陷提示词
+    
+    Args:
+        target_count: 需要生成的提示词数量
+        with_replacement: 是否允许有放回抽样（重复组合）
+        use_weights: 是否使用权重抽样
+    """
+    base_prompt = "WELDSCALLOPS，在焊缝灰度图，位于焊道{pos}{loc}（收弧处）的位置添加一个凹坑缺陷： \ 
+                   凹坑{dir}且轮廓呈{shape}，凹坑区域凹下去的梯度{deg}，\
+                   凹坑仅出现在焊道上，灰度与背景适配。 "
+
+    positions = ["上半部分", "下半部分"]
+    locations = ["末端", "靠近末端"]
+    directions = ["竖直", "水平", "倾斜"]
+    shapes = ["扁圆形", "椭圆形", "不规则形状", "缝隙状"]
+    degrees = [
+        "明显（边缘到中心灰度骤降）且无反光（呈深黑色）",
+        "平缓（边缘到中心灰度渐变）且有反光（灰色）"
+    ]
+    
+    # 权重设置
+    pos_weights = [0.5, 0.5]  # 上下部分权重
+    loc_weights = [0.5, 0.5]  # 位置权重
+    dir_weights = [0.3, 0.3, 0.4]  # 方向权重（倾斜更常见）
+    shape_weights = [0.4, 0.3, 0.2, 0.1]  # 形态权重
+    deg_weights = [0.6, 0.4]  # 梯度权重（明显更常见）
+    
+    prompts = []
+    
+    if with_replacement:
+        # 有放回抽样：可以直接生成，允许重复
+        for _ in range(target_count):
+            if use_weights:
+                # 带权重抽样
+                pos = random.choices(positions, weights=pos_weights, k=1)[0]
+                loc = random.choices(locations, weights=loc_weights, k=1)[0]
+                dir = random.choices(directions, weights=dir_weights, k=1)[0]
+                shape = random.choices(shapes, weights=shape_weights, k=1)[0]
+                deg = random.choices(degrees, weights=deg_weights, k=1)[0]
+            else:
+                # 均匀随机抽样
+                pos = random.choice(positions)
+                loc = random.choice(locations)
+                dir = random.choice(directions)
+                shape = random.choice(shapes)
+                deg = random.choice(degrees)
+            
+            # 生成最终prompt
+            prompt = base_prompt.format(pos=pos, loc=loc, dir=dir, shape=shape, deg=deg)
+            prompts.append(prompt)
+            
+        print(f"已生成{len(prompts)}个提示词（有放回抽样）")
+        
+    else:
+        # 无放回抽样：保持原有逻辑，但不重复
+        combinations = set()
+        max_combos = len(positions) * len(locations) * len(directions) * len(shapes) * len(degrees)
+        actual_target = min(target_count, max_combos)
+        
+        while len(prompts) < actual_target:
+            if use_weights:
+                # 带权重抽样
+                pos = random.choices(positions, weights=pos_weights, k=1)[0]
+                loc = random.choices(locations, weights=loc_weights, k=1)[0]
+                dir = random.choices(directions, weights=dir_weights, k=1)[0]
+                shape = random.choices(shapes, weights=shape_weights, k=1)[0]
+                deg = random.choices(degrees, weights=deg_weights, k=1)[0]
+            else:
+                # 均匀随机抽样
+                pos = random.choice(positions)
+                loc = random.choice(locations)
+                dir = random.choice(directions)
+                shape = random.choice(shapes)
+                deg = random.choice(degrees)
+            
+            # 去重键
+            combo_key = f"{pos}_{loc}_{dir}_{shape}_{deg}"
+            if combo_key in combinations:
+                continue
+            
+            # 生成最终prompt
+            prompt = base_prompt.format(pos=pos, loc=loc, dir=dir, shape=shape, deg=deg)
+            prompts.append(prompt)
+            combinations.add(combo_key)
+        
+        if target_count > max_combos:
+            print(f"提示：最大不重复组合数为{max_combos}，已返回全部组合")
+        print(f"已生成{len(prompts)}个提示词（无放回抽样）")
+    
+    return prompts
 
 def generate_prompts(target_count):
     base_prompt = "WELDSCALLOPS，在焊缝灰度图，位于焊道{pos}{loc}（收弧处）的位置添加一个凹坑缺陷： \ 
